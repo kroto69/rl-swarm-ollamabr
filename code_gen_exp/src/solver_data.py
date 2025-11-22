@@ -1,225 +1,436 @@
-from dataclasses import dataclass
-from typing import Any, List, Dict, Optional
 import re
-import json
-import ast
-import concurrent.futures
-import ollama
-from transformers import AutoTokenizer
-from code_gen_exp.src.utils.solver_utils import (
-    check_eos,
-    parse_python_fence,
-    parse_response,
-    get_solutions,
-    get_unittests,
-    get_questions,
-    get_dataset,
-)
+from typing import Any, Dict, List, Tuple
+import random
+from copy import deepcopy
 
-@dataclass
-class RewardsOllamaConfig:
-    model: str = "qwen2.5-coder:1.5b-instruct"
-    temperature: float = 0.0
-    num_predict: int = 256 
+from datasets import Dataset, load_dataset, concatenate_datasets
+
+from genrl.data import DataManager
+from genrl.logging_utils.global_defs import get_logger
+from genrl.misc_utils.utils import generate_md5_hash_id
+from genrl.state import GameState, WorldState
+from genrl.communication.hivemind.hivemind_backend import HivemindBackend
+from code_gen_exp.src.utils.solver_data_mapper import MBPPMapper, CodeContestsMapper
 
 
-class CodeGenerationRewards:
-    def __init__(self, solver_tokenizer_path: str, solver_token_lim: int, ollama_config: RewardsOllamaConfig = RewardsOllamaConfig()):
-        self.stage = 0
-        self.model = ollama_config.model
-        self.temperature = ollama_config.temperature
-        self.num_predict = ollama_config.num_predict
-        
-        # [FIX] Load tokenizer with trust_remote_code for Qwen models
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            solver_tokenizer_path, 
-            padding_side="left", 
-            trust_remote_code=True
+# --- OPTIMIZED PROMPT WITH XML TAGS ---
+SYSTEM_PROMPTS = {
+    "default": "You are a helpful assistant.",
+    "solver": (
+        "You are an expert Python coding assistant. Your task is to provide a perfect solution to the given problem.\n"
+        "FORMATTING RULES (STRICT):\n"
+        "1. You must enclose the executable Python code within <solution> and </solution> tags.\n"
+        "2. Inside the tags, provide ONLY valid Python code. No markdown, no comments outside the code.\n"
+        "3. The code must be a self-contained function or script that solves the problem.\n"
+        "4. Do not explain your reasoning outside the tags. Just give the code.\n"
+        "\n"
+        "Example Response:\n"
+        "<solution>\n"
+        "def solve(x):\n"
+        "    return x * 2\n"
+        "</solution>"
+    )
+}
+
+MAX_PROPOSER_PROMPT_LENGTH = 2000
+
+def build_prompt(flattened_data: Any) -> Any:
+    """
+    Top-level mapping function to build prompts for the LLM.
+    Defined at module scope to ensure picklability for datasets caching/fingerprinting.
+    """
+    prompt = [
+        {"role": "system", "content": flattened_data["system_prompt"]},
+        {"role": "user", "content": flattened_data["user_prompt"]},
+    ]
+    return {"prompt": prompt}
+
+
+def add_source_dataset(sample, ds_name):
+    sample['original_dataset'] = ds_name
+    return sample
+
+
+class CodeGenerationDataManager(DataManager):
+    """Data Manager for Code Generation Datasets.
+
+    This class integrates code generation datasets with genrl
+    data management framework, providing infinite iteration through reseeding.
+    """
+
+    def __init__(
+        self,
+        system_prompt: str = "default",
+        batch_size: int = 2,
+        local_batch_size: int = 1,
+        proposer_batch_size: int = 1,
+        **kwargs,
+    ):
+        """Initialize the CodeGenerationDataManager."""
+
+        self.system_prompt = SYSTEM_PROMPTS.get(
+            system_prompt, SYSTEM_PROMPTS["default"]
         )
+        self.num_generations = kwargs.get("num_generations", None)
+        self.num_transplant_trees = kwargs.get("num_transplant_trees", 1)
+        assert self.num_transplant_trees >= 0
+
+        # Load Datasets
+        self.local_dataset_mbpp = load_dataset("google-research-datasets/mbpp", split="train", streaming=True)
+        self.local_dataset_mbpp = self.local_dataset_mbpp.map(lambda x: add_source_dataset(x, 'mbpp'))
+
+        self.local_dataset_cc = load_dataset("deepmind/code_contests", split="train", streaming=True)
+        self.local_dataset_cc = self.local_dataset_cc.map(lambda x: add_source_dataset(x, 'code_contests'))
+
+        self.local_dataset = concatenate_datasets([
+            self.local_dataset_mbpp, 
+            self.local_dataset_cc
+        ])
         
-        # [CRITICAL FIX] Fix for Qwen/Llama models where pad_token is missing
-        # This removes the "The attention mask is not set" warning
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.local_batch_size = local_batch_size
+        self.batch_size = batch_size
+        self.proposer_batch_size = proposer_batch_size
+        assert self.local_batch_size + self.proposer_batch_size == self.batch_size, \
+            f"Batch sizes must sum to total batch size, got {self.local_batch_size} and {self.proposer_batch_size}"
+
+        self.local_dataset = self.local_dataset.batch(batch_size=self.local_batch_size)
+        self.local_dataset_iter = iter(self.local_dataset)
+
+    def initialize(self, backend: HivemindBackend):
+        self.backend = backend
+        self.peer_id = str(backend.get_id())
+
+    # --- Helper Methods ---
+    def state_to_user_prompt(self, state: WorldState) -> str:
+        """Convert the state to a user prompt."""
+        return state.environment_states["question"]
+
+    def state_to_test(self, state: WorldState) -> str:
+        """Extract the test from the state."""
+        return state.environment_states["test"]
+
+    def flatten_tree(
+        self, inputs: Dict[Any, Dict[Any, List[Tuple[Any]]]], stage: int
+    ) -> Tuple[Dict[str, List[Any]], Dict[int, Tuple[int, int, int]]]:
+
+        flattened_input = {
+            "system_prompt": [],
+            "user_prompt": [],
+            "test": [],
+            "metadata": [],
+        }
+        index_mapping = {}
+        cur_idx = 0
+        for agent in inputs:
+            for batch_id in inputs[agent]:
+                for node_idx, state in enumerate(inputs[agent][batch_id]):
+                    flattened_input["system_prompt"].append(self.system_prompt)
+                    flattened_input["user_prompt"].append(self.state_to_user_prompt(state))
+                    flattened_input["test"].append(self.state_to_test(state))
+                    if "metadata" in state.environment_states:
+                        flattened_input["metadata"].append(state.environment_states["metadata"])
+                    elif state.metadata is not None:
+                        flattened_input["metadata"].append(state.metadata)
+                    else:
+                        flattened_input["metadata"].append({})
+
+                    index_mapping[cur_idx] = (agent, batch_id, node_idx)
+                    cur_idx += 1
+        return flattened_input, index_mapping
+
+    def prepare_input(
+            self, inputs: Dict[Any, Dict[Any, List[Tuple[Any]]]], stage: int = None
+        ) -> Tuple[Dataset, Dict[int, Tuple[int, int, int]]]:
+            input_flattened, index_mapping = self.flatten_tree(inputs, stage)
             
-        self.solver_token_lim = solver_token_lim
-
-    def _check_syntax(self, code: str) -> bool:
-        """
-        Fast local check: Is the python code syntactically valid?
-        Saves Ollama inference time for garbage code.
-        """
-        try:
-            ast.parse(code)
-            return True
-        except SyntaxError:
-            return False
-        except Exception:
-            return False
-
-    def _build_prompt(self, dataset: str, solution_code: str, unit_tests: str, question: str) -> str:
-        """
-        Builds a prompt optimized for JSON output from the Judge Model.
-        """
-        base_instruction = (
-            "You are an expert code reviewer. Your task is to verify if the provided Python solution logically solves the problem and passes the unit tests.\n"
-            "Analyze the code logic carefully against the tests.\n\n"
-            "RESPONSE FORMAT:\n"
-            "You must output ONLY a JSON object with a single key 'is_correct'.\n"
-            "Do not add explanations outside the JSON.\n"
-            "```json\n"
-            "{\"is_correct\": true}\n"
-            "```\n"
-            "OR\n"
-            "```json\n"
-            "{\"is_correct\": false}\n"
-            "```"
-        )
-        
-        content = (
-            f"--- PROBLEM ---\n{question}\n\n"
-            f"--- TESTS ---\n{unit_tests}\n\n"
-            f"--- CANDIDATE SOLUTION ---\n{solution_code}"
-        )
-        
-        return f"{base_instruction}\n\n{content}"
-
-    def _extract_json_verdict(self, text: str) -> float:
-        """
-        Extract verdict from LLM response using regex. 
-        Returns 1.0 for True, 0.0 for False/Error.
-        """
-        try:
-            # 1. Try finding fenced JSON
-            match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
-            # 2. Try finding raw JSON object
-            if not match:
-                match = re.search(r"(\{.*?\})", text, re.DOTALL)
+            # Check if we have any data to process
+            if not input_flattened or all(len(v) == 0 for v in input_flattened.values()):
+                return Dataset.from_dict({"prompt": []}), {}
             
-            if match:
-                json_str = match.group(1)
-                # Clean potential trailing commas or comments that break json.loads
-                json_str = re.sub(r",\s*}", "}", json_str) 
-                data = json.loads(json_str)
-                
-                # Handle boolean or string "true"/"false"
-                val = data.get("is_correct")
-                if isinstance(val, bool):
-                    return 1.0 if val else 0.0
-                if isinstance(val, str):
-                    return 1.0 if val.lower() == 'true' else 0.0
-                    
-        except Exception:
-            pass
-        
-        # Fallback: Keyword search
-        text_lower = text.lower()
-        if '"is_correct": true' in text_lower or "'is_correct': true" in text_lower:
-            return 1.0
-        return 0.0
+            try:
+                input_flattened = Dataset.from_dict(input_flattened)
+                input_prepared = input_flattened.map(build_prompt)
+                return input_prepared, index_mapping
+            except:
+                return Dataset.from_dict({"prompt": []}), {}
 
-    def _query_ollama_single(self, prompt: str) -> float:
-        """Helper for ThreadPool execution"""
-        try:
-            response = ollama.generate(
-                model=self.model, 
-                prompt=prompt, 
-                options={"temperature": self.temperature, "num_predict": self.num_predict}
+    def prepare_actions(
+        self, outputs: Any, index_mapping: Dict[int, Tuple[Any]]
+    ) -> Dict[Any, List[List[Any]]]:
+        actions = {}
+        for idx, model_output in enumerate(outputs):
+            agent, batch_id, node_idx = index_mapping[idx]
+            if agent not in actions:
+                actions[agent] = {}
+            if batch_id not in actions[agent]:
+                actions[agent][batch_id] = {}
+            actions[agent][batch_id][node_idx] = model_output
+        return actions
+
+    def to_world_state(
+        self,
+        node_state: WorldState,
+    ) -> WorldState:
+        environment_state = node_state.environment_states
+        environment_state["prior_stage_input_states"] = deepcopy(node_state)
+        opponent_state = None
+        personal_state = None
+        world_state = WorldState(
+            environment_states=environment_state,
+            opponent_states=opponent_state,
+            personal_states=personal_state,
+        )
+        return world_state
+
+    def prepare_states(
+        self, current_state: GameState, swarm_states: Dict[Any, Any]
+    ) -> Dict[Any, Dict[Any, List[Tuple[Any]]]]:
+        if self.num_transplant_trees > 0:
+            trees = current_state.trees
+            transplants = self.transplant_trees(
+                current_state, swarm_states, self.num_transplant_trees
             )
-            return self._extract_json_verdict(response.response)
-        except Exception:
-            return 0.0
+            for pair in transplants:
+                agent, batch_id = pair
+                if agent not in trees:
+                    trees[agent] = {}
+                if batch_id not in trees[agent]:
+                    trees[agent][batch_id] = None
+                payload = transplants[pair]
+                received_states, received_actions, received_metadata = (
+                    payload.world_state,
+                    payload.actions,
+                    payload.metadata,
+                )
+                world_state = received_states.environment_states
+                payload_batch_id = generate_md5_hash_id(world_state["question"])
+                assert payload_batch_id == batch_id
+                if (
+                    trees[agent][batch_id] is None
+                ):  # we don't have a tree for this batch item, make one and append actions
+                    trees[agent][batch_id] = current_state.game_tree_factory(
+                        received_states
+                    )
+                    trees[agent][batch_id].append_node_actions(
+                        stage=current_state.stage, node_idx=0, actions=received_actions
+                    )
+                    trees[agent][batch_id][current_state.stage][0][
+                        "metadata"
+                    ] = received_metadata
+                else:  # we already have this tree, and actions were appended in run_game_stage()
+                    pass
+        world_state = current_state.get_latest_state()
+        return world_state
 
-    def reward_fn(self, dataset, solutions, unittests, question) -> List[float]:
-        rewards = []
-        prompts_to_process = []
-        indices_to_process = []
-
-        # --- STEP 1: PRE-FILTERING (CPU) ---
-        for i, solution in enumerate(solutions):
-            # Default penalty
-            current_reward = 0.0
-            
-            if not isinstance(solution, str):
-                rewards.append(-1.5)
-                continue
-            
-            # Clean and parse code
-            parsed_code = parse_python_fence(solution)
-            
-            # Check EOS (End of Sentence) - Bonus if model finished writing
-            eos_found = check_eos(solution, self.tokenizer, self.solver_token_lim)
-            eos_bonus = 0.2 if eos_found else -0.2
-            
-            if not parsed_code:
-                # No code found at all
-                rewards.append(-1.0 + eos_bonus)
-            elif not self._check_syntax(parsed_code):
-                # Code exists but has Syntax Error
-                rewards.append(-0.5 + eos_bonus)
-            else:
-                # Syntax is valid, prepare for Judge LLM
-                # Initialize with just the EOS bonus, we will add Judge score later
-                rewards.append(eos_bonus) 
-                
-                prompt = self._build_prompt(dataset, parsed_code, str(unittests), str(question))
-                prompts_to_process.append(prompt)
-                indices_to_process.append(i)
-
-        # --- STEP 2: PARALLEL JUDGING (IO/Network) ---
-        if prompts_to_process:
-            # Limit max_workers to 4 to match your CPU constraint strategy
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                judge_results = list(executor.map(self._query_ollama_single, prompts_to_process))
-            
-            # Combine results
-            for idx, judge_score in zip(indices_to_process, judge_results):
-                # If Judge says Correct (1.0), we add +1.0. If False, +0.0
-                rewards[idx] += judge_score
-
-        return rewards
-
-    def __call__(self, game_state):
-        solutions_by_agent = get_solutions(game_state, self.stage)
-        unittests_by_agent = get_unittests(game_state, self.stage)
-        questions = get_questions(game_state, self.stage)
-        datasets_by_agent = get_dataset(game_state, self.stage)
+    def transplant_trees(
+        self,
+        current_state: GameState,
+        swarm_states: Dict[Any, Any],
+        num_transplants: int,
+    ) -> Dict[Tuple[Any], Any]:
+        """
+        Selects trees from other agents (Swarm) to transplant into local state.
+        ROBUST FIX: Added type checking to prevent crashes on malformed swarm data.
+        """
+        transplants = {}
         
-        rewards = {}  # Key per agent
-        try:
-            for agent in solutions_by_agent:
-                rewards[agent] = {}  
-                for batch_id in solutions_by_agent[agent]:
-                    rewards[agent][batch_id] = []
-                    
-                    # GRPO structure: We usually have a list of generations for one problem node
-                    # But the genrl structure might be [node1_gens, node2_gens...]
-                    # We iterate nodes
-                    
-                    for node_idx, _ in enumerate(solutions_by_agent[agent][batch_id]):
-                        # Extract data for this specific node/problem
-                        sol_list = solutions_by_agent[agent][batch_id][node_idx] # List of K generations
-                        
-                        # Handle cases where metadata might be singular or list
-                        # We assume unittests/questions are same for all K generations of this node
-                        
-                        curr_unittests = unittests_by_agent[agent][batch_id][node_idx]
-                        curr_question = questions[agent][batch_id][node_idx]
-                        curr_dataset = datasets_by_agent[agent][batch_id][node_idx]
-
-                        # Calculate rewards for the whole list of K generations at once
-                        node_rewards = self.reward_fn(
-                            curr_dataset, 
-                            sol_list, 
-                            curr_unittests, 
-                            curr_question
-                        )
-                        
-                        rewards[agent][batch_id].append(node_rewards)
-                        
-            return rewards
-        except Exception as e:
-            # Log error properly in production, print for now
-            print(f"[Reward Error]: {e}")
+        # Safety Check 1: Swarm states must be a dict
+        if not isinstance(swarm_states, dict):
             return {}
+
+        for agent in swarm_states:
+            # Safety Check 2: Agent data must be dict
+            if not isinstance(swarm_states[agent], dict):
+                continue
+
+            if agent not in current_state.trees:
+                for batch_id in swarm_states[agent]:
+                    # Safety Check 3: Batch data must be list (list of payloads)
+                    if not isinstance(swarm_states[agent][batch_id], list):
+                        continue
+
+                    for payload in swarm_states[agent][batch_id]:
+                        # Validate payload structure
+                        if (
+                            self.num_generations
+                            and hasattr(payload, "actions")
+                            and payload.actions is not None
+                            and isinstance(payload.actions, list)
+                            and len(payload.actions) == self.num_generations
+                        ):
+                            transplants[(agent, batch_id)] = payload
+                            
+        if len(transplants) >= num_transplants:
+            keepers = random.sample(list(transplants), num_transplants)
+        else:
+            keepers = list(transplants)
+
+        return {key: transplants[key] for key in keepers}
+
+    def get_eval_data(self):
+        pass
+
+    def get_round_data(self):       
+        if self.proposer_batch_size > 0:
+            try:            
+                proposer_data = self.backend.get(sub_key="proposer".encode())        
+                proposer_data = prepare_proposer_batch(proposer_data, self.proposer_batch_size)
+            except Exception as e:
+                get_logger().debug(f"Exception while getting proposer data: {e}")
+                proposer_data = []
+        else:
+            proposer_data = []
+        
+        if self.local_batch_size > 0:
+            try:
+                local_data = next(self.local_dataset_iter)
+            except StopIteration:
+                self.local_dataset_iter = iter(self.local_dataset)
+                local_data = next(self.local_dataset_iter)
+            local_data = prepare_local_batch(local_data)
+        else:
+            local_data = []
+
+        combined_data = local_data + proposer_data
+        return combined_data
+
+    def send_response(self, rewards, state):
+        objs = []
+        for agent_id in state:
+            for batch_id in state[agent_id]:
+                node_idx = 0 # don't need to send each generation
+                node = state[agent_id][batch_id][node_idx]
+                proposal_raw = node.personal_states
+                dataset = node.environment_states['metadata']['dataset']
+                batch_rewards = rewards[agent_id][batch_id][node_idx]
+
+                if dataset != 'proposer':
+                    continue
+                obj = {
+                    'proposal_raw': proposal_raw,
+                    'reward': batch_rewards,
+                    'dataset': dataset
+                }
+                objs.append(obj)
+        try:
+            self.backend.put(objs, sub_key="solver".encode())
+        except Exception as e:
+            get_logger().debug(f"Failed to send response: {e}")
+        
+        
+
+# Registry mapping dataset names to their respective mappers
+DATASET_MAPPERS = {
+    'mbpp': MBPPMapper(),
+    'code_contests': CodeContestsMapper()
+}
+
+def prepare_local_batch(batch) -> list[tuple[int, WorldState]]:
+    original_dataset = batch.get('original_dataset', [])
+
+    prompts = []
+    tests = []
+    for i, ds in enumerate(original_dataset):
+        mapper = DATASET_MAPPERS.get(ds)
+        if mapper is None:
+            # Skip unknown dataset or raise, but better to skip in swarm context
+            continue 
+        
+        try:
+            prompt = mapper.map_prompt(batch, i)
+            test = mapper.map_test(batch, i)
+            prompts.append(prompt)
+            tests.append(test)
+        except Exception:
+            continue
+
+    local_data = []
+    for prompt, test, ds in zip(prompts, tests, original_dataset):
+        mapper = DATASET_MAPPERS.get(ds)
+        if not mapper: continue
+
+        question = mapper.format_question(prompt, test)
+        
+        env_state = {
+            "question": question,
+            "test": test,
+            "metadata": {'dataset': ds}
+        }
+        world_state = WorldState(
+            environment_states=env_state,
+            opponent_states=None,
+            personal_states=None,
+        )
+        proposal_id = generate_md5_hash_id(env_state["question"])
+        local_data.append([proposal_id, world_state])
+
+    return local_data
+
+def prepare_proposer_batch(batch: dict[str, list[dict]], batch_size: int) -> list[tuple[int, WorldState]]:
+    proposer_data = []
+    if not isinstance(batch, dict):
+        return []
+
+    for proposer_id in batch:
+        proposal_list = batch[proposer_id]
+        if not isinstance(proposal_list, list):
+            continue
+
+        for proposal in proposal_list:
+            if not isinstance(proposal, dict):
+                continue
+
+            try:
+                proposal_question = str(proposal.get('proposal_question', ''))[:MAX_PROPOSER_PROMPT_LENGTH]
+                proposal_tests = str(proposal.get('proposal_tests', ''))[:MAX_PROPOSER_PROMPT_LENGTH]
+                proposal_raw = str(proposal.get('proposal_raw', ''))[:MAX_PROPOSER_PROMPT_LENGTH]
+
+                env_state = {
+                    "question": proposal_question,
+                    "test": proposal_tests,
+                    "metadata": {'dataset': 'proposer'}
+                }
+                world_state = WorldState(
+                    environment_states=env_state,
+                    opponent_states=None,
+                    personal_states=proposal_raw,
+                )
+                proposal_id = generate_md5_hash_id(env_state["question"])
+            
+                proposer_data.append([proposal_id, world_state])
+
+                if len(proposer_data) >= batch_size:
+                    return proposer_data
+            except Exception:
+                continue
+
+    return proposer_data
+
+# --- ROBUST PARSER FOR XML & MARKDOWN ---
+def parse_python_fence(text: str) -> str:
+    """
+    Extracts python code from text.
+    Priority 1: XML tags <solution>...</solution> (Best for automation)
+    Priority 2: Markdown ```python ... ``` (Fallback)
+    Priority 3: Raw text (Last resort)
+    """
+    if not isinstance(text, str):
+        return ""
+
+    # 1. Try XML Extraction
+    xml_match = re.search(r'<solution>(.*?)</solution>', text, re.DOTALL)
+    if xml_match:
+        code = xml_match.group(1).strip()
+        # Clean up if model put markdown INSIDE tags
+        code = re.sub(r'^```python\s*', '', code)
+        code = re.sub(r'^```\s*', '', code)
+        code = re.sub(r'```$', '', code)
+        return code.strip()
+
+    # 2. Try Markdown Extraction
+    md_match = re.search(r'```python(.*?)```', text, re.DOTALL) or re.search(r'```(.*?)```', text, re.DOTALL)
+    if md_match:
+        return md_match.group(1).strip()
+
+    # 3. No fence found, return stripped text
+    return text.strip()
