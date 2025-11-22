@@ -1,5 +1,9 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, List, Dict, Optional
+import re
+import json
+import ast
+import concurrent.futures
 import ollama
 from transformers import AutoTokenizer
 from code_gen_exp.src.utils.solver_utils import (
@@ -16,7 +20,7 @@ from code_gen_exp.src.utils.solver_utils import (
 class RewardsOllamaConfig:
     model: str = "qwen2.5-coder:1.5b-instruct"
     temperature: float = 0.0
-    num_predict: int = 512
+    num_predict: int = 256 
 
 
 class CodeGenerationRewards:
@@ -25,74 +29,156 @@ class CodeGenerationRewards:
         self.model = ollama_config.model
         self.temperature = ollama_config.temperature
         self.num_predict = ollama_config.num_predict
-        self.tokenizer = AutoTokenizer.from_pretrained(solver_tokenizer_path, padding_side="left")
+        
+        # [FIX] Load tokenizer with trust_remote_code for Qwen models
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            solver_tokenizer_path, 
+            padding_side="left", 
+            trust_remote_code=True
+        )
+        
+        # [CRITICAL FIX] Fix for Qwen/Llama models where pad_token is missing
+        # This removes the "The attention mask is not set" warning
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            
         self.solver_token_lim = solver_token_lim
 
+    def _check_syntax(self, code: str) -> bool:
+        """
+        Fast local check: Is the python code syntactically valid?
+        Saves Ollama inference time for garbage code.
+        """
+        try:
+            ast.parse(code)
+            return True
+        except SyntaxError:
+            return False
+        except Exception:
+            return False
 
     def _build_prompt(self, dataset: str, solution_code: str, unit_tests: str, question: str) -> str:
-        if dataset == 'mbpp':
-            return ("You are an expert programming evaluator who needs to decide whether the given solution will pass all the given unit tests.\n"
-                 "You will be given a problem, a list of unit tests, and a solution.\n"
-                 "Walk through each unit test and dry run the solution.\n"
-                 "If the solution passes all the unit tests, put is_correct as true.\n"
-                 "If the solution fails even a single unit test, put is_correct as false.\n"
-                 "Put you final answer in a JSON fenced block. The JSON should have only one key: is_correct. It should be a boolean.\n"
-                 "Its format should be as follows:\n"
-                 "```json\n{\n  \"is_correct\": true | false\n}\n```\n\n"
-                 "--- Problem ---\n"
-                 f"{question}\n\n"
-                 "--- Unit Tests ---\n"
-                 f"{unit_tests}\n\n"
-                 "--- Solution ---\n"
-                 f"{solution_code}\n\n"
-            )
-        elif dataset == 'code_contests':
-            return ("You are an expert programming evaluator who needs to decide whether the given solution will pass all the given unit tests.\n"              
-                "With the code you will be given the inputs for unit tests along with the associated outputs. \n"
-                "Decide if the given python code will produce the given outputs when run against the inputs. \n"
-                "Put you final answer in a JSON fenced block. The JSON should have only one key: is_correct. It should be a boolean.\n"
-                "Its format should be as follows:\n"
-                "```json\n{\n  \"is_correct\": true | false\n}\n```\n\n"
-                "--- Problem ---\n"
-                f"{question}\n\n"
-                "--- Unit Tests ---\n"
-                f"{unit_tests}\n\n"
-                "--- Solution ---\n"
-                f"{solution_code}\n\n"
-            )
+        """
+        Builds a prompt optimized for JSON output from the Judge Model.
+        """
+        base_instruction = (
+            "You are an expert code reviewer. Your task is to verify if the provided Python solution logically solves the problem and passes the unit tests.\n"
+            "Analyze the code logic carefully against the tests.\n\n"
+            "RESPONSE FORMAT:\n"
+            "You must output ONLY a JSON object with a single key 'is_correct'.\n"
+            "Do not add explanations outside the JSON.\n"
+            "```json\n"
+            "{\"is_correct\": true}\n"
+            "```\n"
+            "OR\n"
+            "```json\n"
+            "{\"is_correct\": false}\n"
+            "```"
+        )
+        
+        content = (
+            f"--- PROBLEM ---\n{question}\n\n"
+            f"--- TESTS ---\n{unit_tests}\n\n"
+            f"--- CANDIDATE SOLUTION ---\n{solution_code}"
+        )
+        
+        return f"{base_instruction}\n\n{content}"
 
-    def _extract_json(self, text: str) -> Any:
-        match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
-        if match:
-            return json.loads(match.group(1))
-        return json.loads(text)
+    def _extract_json_verdict(self, text: str) -> float:
+        """
+        Extract verdict from LLM response using regex. 
+        Returns 1.0 for True, 0.0 for False/Error.
+        """
+        try:
+            # 1. Try finding fenced JSON
+            match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+            # 2. Try finding raw JSON object
+            if not match:
+                match = re.search(r"(\{.*?\})", text, re.DOTALL)
+            
+            if match:
+                json_str = match.group(1)
+                # Clean potential trailing commas or comments that break json.loads
+                json_str = re.sub(r",\s*}", "}", json_str) 
+                data = json.loads(json_str)
+                
+                # Handle boolean or string "true"/"false"
+                val = data.get("is_correct")
+                if isinstance(val, bool):
+                    return 1.0 if val else 0.0
+                if isinstance(val, str):
+                    return 1.0 if val.lower() == 'true' else 0.0
+                    
+        except Exception:
+            pass
+        
+        # Fallback: Keyword search
+        text_lower = text.lower()
+        if '"is_correct": true' in text_lower or "'is_correct': true" in text_lower:
+            return 1.0
+        return 0.0
 
-    def reward_fn(self, dataset, solutions, unittests, question):
+    def _query_ollama_single(self, prompt: str) -> float:
+        """Helper for ThreadPool execution"""
+        try:
+            response = ollama.generate(
+                model=self.model, 
+                prompt=prompt, 
+                options={"temperature": self.temperature, "num_predict": self.num_predict}
+            )
+            return self._extract_json_verdict(response.response)
+        except Exception:
+            return 0.0
+
+    def reward_fn(self, dataset, solutions, unittests, question) -> List[float]:
         rewards = []
-        for solution in solutions:
+        prompts_to_process = []
+        indices_to_process = []
+
+        # --- STEP 1: PRE-FILTERING (CPU) ---
+        for i, solution in enumerate(solutions):
+            # Default penalty
+            current_reward = 0.0
+            
             if not isinstance(solution, str):
-                reward = -1.2
+                rewards.append(-1.5)
+                continue
+            
+            # Clean and parse code
+            parsed_code = parse_python_fence(solution)
+            
+            # Check EOS (End of Sentence) - Bonus if model finished writing
+            eos_found = check_eos(solution, self.tokenizer, self.solver_token_lim)
+            eos_bonus = 0.2 if eos_found else -0.2
+            
+            if not parsed_code:
+                # No code found at all
+                rewards.append(-1.0 + eos_bonus)
+            elif not self._check_syntax(parsed_code):
+                # Code exists but has Syntax Error
+                rewards.append(-0.5 + eos_bonus)
             else:
-                parsed_code = parse_python_fence(solution)
-                eos_found = check_eos(solution, self.tokenizer, self.solver_token_lim)
-                if parsed_code is None: # No fenced code found
-                    reward = -1.0
-                else:
-                    try:
-                        prompt = self._build_prompt(dataset, str(solution), str(unittests), str(question))
-                        response = ollama.generate(model=self.model, prompt=prompt, options={"temperature": self.temperature, "num_predict": self.num_predict})
-                        raw_text = response.response
-                        reward = parse_response(raw_text)
-                        if reward is None:
-                            reward = 0.0
-                    except:
-                        reward = 0.0
-                reward += 0.2 if eos_found else -0.2
-            rewards.append(reward)
+                # Syntax is valid, prepare for Judge LLM
+                # Initialize with just the EOS bonus, we will add Judge score later
+                rewards.append(eos_bonus) 
+                
+                prompt = self._build_prompt(dataset, parsed_code, str(unittests), str(question))
+                prompts_to_process.append(prompt)
+                indices_to_process.append(i)
+
+        # --- STEP 2: PARALLEL JUDGING (IO/Network) ---
+        if prompts_to_process:
+            # Limit max_workers to 4 to match your CPU constraint strategy
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                judge_results = list(executor.map(self._query_ollama_single, prompts_to_process))
+            
+            # Combine results
+            for idx, judge_score in zip(indices_to_process, judge_results):
+                # If Judge says Correct (1.0), we add +1.0. If False, +0.0
+                rewards[idx] += judge_score
 
         return rewards
-
-
 
     def __call__(self, game_state):
         solutions_by_agent = get_solutions(game_state, self.stage)
@@ -103,18 +189,37 @@ class CodeGenerationRewards:
         rewards = {}  # Key per agent
         try:
             for agent in solutions_by_agent:
-                rewards[agent] = {}  # Will store a list per batch item
+                rewards[agent] = {}  
                 for batch_id in solutions_by_agent[agent]:
                     rewards[agent][batch_id] = []
+                    
+                    # GRPO structure: We usually have a list of generations for one problem node
+                    # But the genrl structure might be [node1_gens, node2_gens...]
+                    # We iterate nodes
+                    
                     for node_idx, _ in enumerate(solutions_by_agent[agent][batch_id]):
-                        rewards[agent][batch_id].append(
-                            self.reward_fn(
-                                datasets_by_agent[agent][batch_id][node_idx],
-                                solutions_by_agent[agent][batch_id][node_idx],
-                                unittests_by_agent[agent][batch_id][node_idx],
-                                questions[agent][batch_id][node_idx]
-                            )
+                        # Extract data for this specific node/problem
+                        sol_list = solutions_by_agent[agent][batch_id][node_idx] # List of K generations
+                        
+                        # Handle cases where metadata might be singular or list
+                        # We assume unittests/questions are same for all K generations of this node
+                        
+                        curr_unittests = unittests_by_agent[agent][batch_id][node_idx]
+                        curr_question = questions[agent][batch_id][node_idx]
+                        curr_dataset = datasets_by_agent[agent][batch_id][node_idx]
+
+                        # Calculate rewards for the whole list of K generations at once
+                        node_rewards = self.reward_fn(
+                            curr_dataset, 
+                            sol_list, 
+                            curr_unittests, 
+                            curr_question
                         )
+                        
+                        rewards[agent][batch_id].append(node_rewards)
+                        
             return rewards
         except Exception as e:
+            # Log error properly in production, print for now
+            print(f"[Reward Error]: {e}")
             return {}
