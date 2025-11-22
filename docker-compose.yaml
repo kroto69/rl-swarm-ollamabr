@@ -8,6 +8,8 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
     depends_on:
       - otel-collector
+    ports:
+      - "8080:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/healthz"]
       interval: 30s
@@ -16,9 +18,8 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.120.0
     ports:
-      - "4317:4317"  # OTLP gRPC
-      - "4318:4318"  # OTLP HTTP
-      - "55679:55679"  # Prometheus metrics (optional)
+      - "4317:4317"
+      - "4318:4318"
     environment:
       - OTEL_LOG_LEVEL=DEBUG
     healthcheck:
@@ -34,24 +35,42 @@ services:
       args:
         - BASE_IMAGE=ubuntu:24.04
     depends_on:
-      - ollama
+      - otel-collector
     ports:
-      - 3000:3000
+      - "3000:3000"
+    # 1. JEMBATAN KE HOST (Agar docker bisa panggil localhost laptop)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
+      - ./code_gen_exp:/home/gensyn/rl_swarm/code_gen_exp 
       - ./user/modal-login:/home/gensyn/rl_swarm/modal-login/temp-data
       - ./user/keys:/home/gensyn/rl_swarm/keys
       - ./user/configs:/home/gensyn/rl_swarm/configs
       - ./user/logs:/home/gensyn/rl_swarm/logs
+    
     environment:
       - HF_TOKEN=${HF_TOKEN}
-      - GENSYN_RESET_CONFIG=${GENSYN_RESET_CONFIG}
-      - OLLAMA_HOST=http://ollama:11434
+      
+      # --- CPU & THREAD LIMITS ---
+      - OMP_NUM_THREADS=5
+      - MKL_NUM_THREADS=5
+      - TORCH_NUM_THREADS=5
+      - RAY_DEDICATED_CPU_CORES=5
+      
+      # --- NETWORK FIX ---
+      - HIVEMIND_USE_IPV6=0
+      - HIVEMIND_USE_LOCALHOST=0
+      
+      # --- OLLAMA FIX (WAJIB ADA) ---
+      # Memberitahu script python: "Jangan cari Ollama di dalam container,
+      # tapi cari di IP Host lewat pintu belakang."
+      - OLLAMA_HOST=http://host.docker.internal:11434
 
-  # Requires the NVIDIA Drivers version >=525.60.13 to be installed, as well
-  # as the nvidia-container-toolkit.
-  # https://docs.nvidia.com/deploy/cuda-compatibility/index.html#cuda-11-and-later-defaults-to-minor-version-compatibility
-  # https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/
-  # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 30G
   swarm-gpu:
     profiles: ["swarm"]
     build:
@@ -79,9 +98,3 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-  ollama:
-    image: ollama/ollama:0.11.10
-    ports:
-      - "11434:11434"
-    volumes:
-      - ./ollama-data:/root/.ollama
